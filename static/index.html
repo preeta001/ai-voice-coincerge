@@ -72,6 +72,10 @@ function connect() {
       speak(m.text);
     } else if (m.type === "first_token") {
       $("m-ft").textContent = m.ms + " ms";
+    } else if (m.type === "error") {
+      bubble = null;
+      add("sys", "turn failed: " + m.text);
+      state.textContent = on ? "listening" : "idle";
     } else if (m.type === "done") {
       bubble = null;
       state.textContent = on ? "listening" : "idle";

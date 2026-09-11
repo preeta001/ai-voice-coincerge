@@ -9,7 +9,9 @@ import asyncio
 import os
 import re
 import time
+from contextlib import suppress
 from functools import lru_cache
+from pathlib import Path
 
 import anthropic
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -129,6 +131,12 @@ async def respond(sock: WebSocket, history: list[dict], meter: dict, text: str) 
                     ),
                 }
             )
+    except asyncio.CancelledError:
+        raise  # barge-in; the partial answer is kept by the finally block
+    except Exception as exc:
+        # Never strand the caller on "thinking" - the UI has to be told.
+        with suppress(Exception):
+            await sock.send_json({"type": "error", "text": str(exc)[:200]})
     finally:
         # Keep whatever was actually spoken before the cut, so the next turn's
         # context matches what the guest heard - not what the model planned.
@@ -159,4 +167,6 @@ async def ws(sock: WebSocket) -> None:
             turn.cancel()
 
 
-app.mount("/", StaticFiles(directory="static", html=True), name="static")
+# Absolute so the server runs from any working directory.
+STATIC = Path(__file__).parent / "static"
+app.mount("/", StaticFiles(directory=STATIC, html=True), name="static")
