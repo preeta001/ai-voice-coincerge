@@ -1,0 +1,148 @@
+<!doctype html>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>AI Voice Concierge</title>
+<style>
+  :root { color-scheme: dark; --bg:#0e1014; --fg:#e8eaed; --dim:#8b929e; --line:#242832; --accent:#5b8cff; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.55 ui-sans-serif,system-ui,sans-serif;
+         display:flex; flex-direction:column; height:100dvh; }
+  header { padding:14px 18px; border-bottom:1px solid var(--line); display:flex; gap:12px; align-items:center; }
+  h1 { font-size:15px; margin:0; font-weight:600; letter-spacing:-.01em; }
+  #state { color:var(--dim); font-size:13px; }
+  #log { flex:1; overflow-y:auto; padding:18px; display:flex; flex-direction:column; gap:10px; }
+  .msg { max-width:min(620px,88%); padding:9px 13px; border-radius:13px; white-space:pre-wrap; }
+  .you { align-self:flex-end; background:var(--accent); }
+  .bot { align-self:flex-start; background:#1a1e27; border:1px solid var(--line); }
+  .cut { opacity:.55; font-style:italic; }
+  .sys { align-self:center; color:var(--dim); font-size:12px; }
+  footer { border-top:1px solid var(--line); padding:12px 18px; display:flex; gap:14px; align-items:center; flex-wrap:wrap; }
+  button { background:var(--accent); color:#fff; border:0; border-radius:9px; padding:10px 18px;
+           font:inherit; font-weight:600; cursor:pointer; }
+  button[data-on="1"] { background:#c0392b; }
+  #metrics { color:var(--dim); font:12px ui-monospace,monospace; display:flex; gap:16px; flex-wrap:wrap; }
+  #metrics b { color:var(--fg); font-weight:600; }
+</style>
+
+<header>
+  <h1>AI Voice Concierge</h1>
+  <span id="state">idle</span>
+</header>
+<div id="log"><div class="sys">Press Talk and speak. Interrupt any time &mdash; it stops mid-sentence.</div></div>
+<footer>
+  <button id="mic">Talk</button>
+  <div id="metrics">
+    <span>first token <b id="m-ft">&ndash;</b></span>
+    <span>turn <b id="m-turn">&ndash;</b></span>
+    <span>tokens <b id="m-tok">&ndash;</b></span>
+    <span>session <b id="m-usd">$0.000000</b></span>
+    <span>per turn <b id="m-avg">&ndash;</b></span>
+    <span>barge-ins <b id="m-cut">0</b></span>
+  </div>
+</footer>
+
+<script>
+const log = document.getElementById("log");
+const state = document.getElementById("state");
+const mic = document.getElementById("mic");
+const $ = id => document.getElementById(id);
+
+const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+if (!SR) add("sys", "This browser has no Web Speech API. Use Chrome or Edge.");
+
+let ws, rec, on = false, speaking = "", bubble = null, cuts = 0;
+
+function add(cls, text) {
+  const d = document.createElement("div");
+  d.className = "msg " + cls;
+  d.textContent = text;
+  log.append(d);
+  log.scrollTop = log.scrollHeight;
+  return d;
+}
+
+function connect() {
+  ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws`);
+  ws.onmessage = e => {
+    const m = JSON.parse(e.data);
+    if (m.type === "say") {
+      bubble = bubble || add("bot", "");
+      bubble.textContent += (bubble.textContent ? " " : "") + m.text;
+      log.scrollTop = log.scrollHeight;
+      speak(m.text);
+    } else if (m.type === "first_token") {
+      $("m-ft").textContent = m.ms + " ms";
+    } else if (m.type === "done") {
+      bubble = null;
+      state.textContent = on ? "listening" : "idle";
+      $("m-turn").textContent = m.turn_ms + " ms";
+      $("m-tok").textContent = `${m.tokens_in} in / ${m.tokens_out} out`;
+      $("m-usd").textContent = "$" + m.session_usd.toFixed(6);
+      $("m-avg").textContent = "$" + m.usd_per_turn.toFixed(6);
+    }
+  };
+  ws.onclose = () => { if (on) setTimeout(connect, 500); };
+}
+
+// Speak sentence by sentence. `speaking` holds the text currently in the
+// speakers so the recognizer can tell the guest's voice from our own echo.
+function speak(text) {
+  const u = new SpeechSynthesisUtterance(text);
+  u.rate = 1.05;
+  u.onstart = () => { speaking += " " + text.toLowerCase(); state.textContent = "speaking"; };
+  u.onend = () => {
+    if (!speechSynthesis.speaking) {
+      speaking = "";
+      state.textContent = on ? "listening" : "idle";
+    }
+  };
+  speechSynthesis.speak(u);
+}
+
+// The mic hears our own TTS through the speakers. Treat a transcript as a real
+// interruption only when it is not just an echo of what we are saying now.
+function isEcho(said) {
+  const w = said.toLowerCase().trim().split(/\s+/).filter(Boolean);
+  if (!w.length) return true;
+  return w.every(x => speaking.includes(x));
+}
+
+function bargeIn() {
+  speechSynthesis.cancel();
+  speaking = "";
+  if (bubble) { bubble.classList.add("cut"); bubble = null; }
+  ws?.send(JSON.stringify({ type: "barge_in" }));
+  $("m-cut").textContent = ++cuts;
+}
+
+function listen() {
+  rec = new SR();
+  rec.continuous = true;
+  rec.interimResults = true;
+  rec.lang = "en-IN";
+
+  rec.onresult = e => {
+    for (let i = e.resultIndex; i < e.results.length; i++) {
+      const said = e.results[i][0].transcript;
+      if (speechSynthesis.speaking && !isEcho(said)) bargeIn();
+      if (!e.results[i].isFinal) continue;
+      if (isEcho(said)) continue;
+      add("you", said.trim());
+      state.textContent = "thinking";
+      ws?.send(JSON.stringify({ type: "user_text", text: said }));
+    }
+  };
+  rec.onerror = e => { if (e.error !== "no-speech") add("sys", "mic: " + e.error); };
+  rec.onend = () => { if (on) rec.start(); };  // Chrome stops after ~60s of quiet
+  rec.start();
+}
+
+mic.onclick = () => {
+  on = !on;
+  mic.dataset.on = on ? "1" : "";
+  mic.textContent = on ? "Stop" : "Talk";
+  state.textContent = on ? "listening" : "idle";
+  if (on) { connect(); listen(); }
+  else { rec?.stop(); speechSynthesis.cancel(); ws?.close(); }
+};
+</script>
