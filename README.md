@@ -3,14 +3,16 @@
 A real-time spoken concierge for a hotel front desk. You talk, it talks back, and
 you can cut it off mid-sentence the way you would interrupt a person.
 
-Built to be honest about the three things that actually make a voice agent hard:
+Built to be honest about the things that actually make a voice agent hard:
 **how long the guest waits before hearing anything, what happens when they
-interrupt, and what a conversation costs.** All three are measured, not claimed.
+interrupt, what a conversation costs, and what happens when the line drops.**
 
 ```
 browser (Web Speech API)  ──ws──►  FastAPI  ──►  Claude (streaming)
    mic → text                       sentence splitter
    text → speakers  ◄────ws────     per-turn cancel + token meter
+                                         │
+                                       Redis  (call history, per call id)
 ```
 
 ## Run it
@@ -18,6 +20,7 @@ browser (Web Speech API)  ──ws──►  FastAPI  ──►  Claude (streami
 ```bash
 pip install -r requirements.txt
 cp .env.example .env        # add your Anthropic API key
+docker run -d --name concierge-redis -p 6379:6379 redis:7
 uvicorn server:app --reload
 ```
 
@@ -25,7 +28,8 @@ Open <http://127.0.0.1:8000>, press **Talk**, and speak. Chrome or Edge — the
 Web Speech API is not in Firefox or Safari.
 
 ```bash
-python test_concierge.py    # turn logic, no API key needed
+pip install fakeredis       # tests use an in-memory Redis
+python test_concierge.py    # turn logic + call store, no API key or Redis server
 python bench.py             # latency + cost, needs a key
 ```
 
@@ -63,6 +67,23 @@ Every response's `usage` is accumulated and the running cost is on screen while
 you talk. History is trimmed to the last 8 exchanges — a voice call that runs
 twenty minutes otherwise pays to re-send the whole conversation every turn.
 
+### 4. A dropped line must not wipe the call
+
+The browser reconnects 500 ms after the socket drops. When history lived in
+the socket, every reconnect started the call from zero. Now the browser keeps a
+call id for the tab (`sessionStorage`) and sends it on connect; the server
+loads that call's history from Redis.
+
+- `RPUSH` + `LTRIM` keep Redis at the same 8-exchange cap the model sees, and
+  `EXPIRE` drops calls idle for 30 minutes (`CONCIERGE_CALL_TTL`).
+- The server holds no call state of its own, so any instance can serve a turn.
+- Barge-in waits for the cut turn to save what was spoken before the next turn
+  starts, so history order in Redis matches what the guest heard.
+- The call id must be a UUID; anything else gets a fresh id, so a client can't
+  choose its own Redis key.
+
+The per-socket cost meter still resets on reconnect; the history does not.
+
 ## Measured numbers
 
 Run `python bench.py` and paste your own results here. It reports p50/p95 for
@@ -76,14 +97,15 @@ a projection per 1,000 turns.
 | full turn | | |
 
 Model is set by `CONCIERGE_MODEL`. Default is `claude-opus-5`;
-`claude-haiku-4-5` is the latency- and cost-optimised swap — worth running the
-benchmark on both before deciding.
+`claude-haiku-5-5` is the latency- and cost-optimised swap — worth running the
+benchmark on both before deciding. (`claude-haiku-4-5` rejects the
+`effort` setting every turn sends, so it errors here.)
 
 | model | in $/1M | out $/1M |
 | --- | --- | --- |
 | `claude-opus-5` | 5.00 | 25.00 |
 | `claude-sonnet-5` | 2.00 | 10.00 |
-| `claude-haiku-4-5` | 1.00 | 5.00 |
+| `claude-haiku-5-5` | 0.10 | 0.50 |
 
 ## Scope
 
@@ -94,8 +116,8 @@ Deliberately not built, and why:
   audio to the server is what you do when you need telephony, a specific voice,
   or a language the browser lacks — and then the interesting code, the part in
   this repo, is unchanged.
-- **No database.** History lives in the WebSocket connection. One caller, one
-  call.
+- **No database beyond Redis.** Calls are short-lived and expire; nothing is
+  kept after a call ends.
 - **No retrieval.** The hotel's facts are in the system prompt, which is the
   right call at this size; a fact base that outgrows a prompt is a different
   project.
