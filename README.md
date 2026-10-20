@@ -8,19 +8,21 @@ Built to be honest about the things that actually make a voice agent hard:
 interrupt, what a conversation costs, and what happens when the line drops.**
 
 ```
-browser (Web Speech API)  ──ws──►  FastAPI  ──►  Claude (streaming)
+browser (Web Speech API)  ──ws──►  FastAPI  ──►  Claude / Groq (streaming)
    mic → text                       sentence splitter
    text → speakers  ◄────ws────     per-turn cancel + token meter
-                                         │
-                                       Redis  (call history, per call id)
+                                      │                 │
+                       Redis: live call state     MongoDB: full transcripts
+                       (capped, expires)          (one document per call)
 ```
 
 ## Run it
 
 ```bash
 pip install -r requirements.txt
-cp .env.example .env        # add your Anthropic API key
+cp .env.example .env        # add your Anthropic (or Groq) API key
 docker run -d --name concierge-redis -p 6379:6379 redis:7
+docker run -d --name concierge-mongo -p 27017:27017 mongo:7
 uvicorn server:app --reload
 ```
 
@@ -29,7 +31,7 @@ Web Speech API is not in Firefox or Safari.
 
 ```bash
 pip install fakeredis       # tests use an in-memory Redis
-python test_concierge.py    # turn logic + call store, no API key or Redis server
+python test_concierge.py    # turn logic, Redis + Mongo stores; no key, no servers
 python bench.py             # latency + cost, needs a key
 ```
 
@@ -84,6 +86,20 @@ loads that call's history from Redis.
 
 The per-socket cost meter still resets on reconnect; the history does not.
 
+### 5. Live state and the record are different jobs
+
+Redis is the call's working memory: capped at what the model sees, gone 30
+minutes after the call goes quiet. That is the wrong place for a record. Each
+finished turn is also upserted into MongoDB (`concierge.calls`, `_id` = call
+id): `$push` appends the guest's line and the reply to an uncapped `turns`
+array, cut-off replies are marked `"cut": true`, and `$inc` keeps token totals.
+One document per call reads naturally as a transcript and needs no joins.
+
+The write happens after the reply has been spoken, so it never delays speech,
+and it is best-effort: if MongoDB is down, the turn is logged as not archived
+and the call carries on (a test points the real driver at a dead port to prove
+it).
+
 ## Measured numbers
 
 `bench.py` reports p50/p95 for time-to-first-token, time-to-first-speech, and
@@ -136,8 +152,8 @@ Deliberately not built, and why:
   audio to the server is what you do when you need telephony, a specific voice,
   or a language the browser lacks — and then the interesting code, the part in
   this repo, is unchanged.
-- **No database beyond Redis.** Calls are short-lived and expire; nothing is
-  kept after a call ends.
+- **No search or analytics on transcripts yet.** They are stored, one
+  document per call; querying them is the next project.
 - **No retrieval.** The hotel's facts are in the system prompt, which is the
   right call at this size; a fact base that outgrows a prompt is a different
   project.

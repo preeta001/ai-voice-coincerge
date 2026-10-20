@@ -11,11 +11,13 @@ import fakeredis
 from server import (
     CALL_TTL_S,
     MAX_TURNS,
+    archive_turn,
     cost_usd,
     history_key,
     load_history,
     remember,
     split_sentences,
+    transcript_update,
     trim,
 )
 
@@ -77,6 +79,45 @@ def test_history_survives_reconnect_capped_and_expiring():
         assert await load_history(r, "other-call") == []  # calls don't leak
 
     asyncio.run(go())
+
+
+def test_transcript_marks_cut_replies_and_skips_silent_ones():
+    usage = {"in": 300, "out": 20}
+    cut = transcript_update("pool hours?", "The pool is open six", True, usage)
+    assert cut["$push"]["turns"]["$each"] == [
+        {"role": "user", "content": "pool hours?"},
+        {"role": "assistant", "content": "The pool is open six", "cut": True},
+    ]
+    assert cut["$inc"] == {"tokens_in": 300, "tokens_out": 20}
+    # Barge-in before the agent said anything: only the guest's line is kept.
+    silent = transcript_update("wait", "", True, {"in": 0, "out": 0})
+    assert silent["$push"]["turns"]["$each"] == [{"role": "user", "content": "wait"}]
+
+
+def test_archive_upserts_one_document_per_call():
+    seen = []
+
+    class FakeCalls:
+        async def update_one(self, flt, update, upsert=False):
+            seen.append((flt, upsert))
+
+    asyncio.run(archive_turn(FakeCalls(), "call-1", {"$set": {}}))
+    assert seen == [({"_id": "call-1"}, True)]
+
+
+def test_archive_survives_mongo_being_down():
+    # Real driver, nothing listening: the call must carry on, quickly.
+    import time
+
+    from pymongo import AsyncMongoClient
+
+    async def go():
+        dead = AsyncMongoClient("mongodb://127.0.0.1:1", serverSelectionTimeoutMS=300)
+        t0 = time.perf_counter()
+        await archive_turn(dead.concierge.calls, "call-1", {"$set": {"x": 1}})
+        return time.perf_counter() - t0
+
+    assert asyncio.run(go()) < 3  # gave up and logged; no exception reached the call
 
 
 def test_groq_stream_yields_text_and_usage():

@@ -4,4 +4,5 @@ fastapi>=0.115
 uvicorn[standard]>=0.32
 websockets>=13
 redis>=5
+pymongo>=4.10
 python-dotenv>=1.0

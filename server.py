@@ -4,18 +4,24 @@ One WebSocket per caller. Audio capture/playback is done in the browser
 (Web Speech API); this process owns the LLM turn, sentence-level streaming,
 barge-in cancellation, history trimming, and cost accounting.
 
-Call history lives in Redis, keyed by a call id the browser keeps for the tab,
-so a dropped socket reconnects mid-call with its context and any server
-instance can serve the next turn.
+Two stores, two jobs:
+- Redis holds the live call (capped history, expires), keyed by a call id the
+  browser keeps for the tab, so a dropped socket reconnects mid-call with its
+  context and any server instance can serve the next turn.
+- MongoDB keeps the permanent record: one document per call with the full,
+  uncapped transcript, which replies were cut off, and token totals. It is
+  written after each turn is spoken, so it never delays speech.
 """
 
 import asyncio
 import json
+import logging
 import os
 import re
 import time
 import uuid
 from contextlib import suppress
+from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 
@@ -36,6 +42,9 @@ MODEL = os.getenv(
 MAX_TURNS = int(os.getenv("CONCIERGE_MAX_TURNS", "8"))
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 CALL_TTL_S = int(os.getenv("CONCIERGE_CALL_TTL", "1800"))  # idle calls expire
+MONGO_URL = os.getenv("MONGO_URL", "mongodb://localhost:27017")
+
+log = logging.getLogger("concierge")
 
 # $ per 1M tokens (input, output), list pricing. Groq's free tier bills $0;
 # its rows show what the same traffic would cost on the paid tier.
@@ -187,21 +196,62 @@ async def remember(r: Redis, call_id: str, history: list[dict], msg: dict) -> No
         await p.execute()
 
 
+@lru_cache(maxsize=1)
+def get_transcripts():
+    """Mongo collection `concierge.calls`: one document per call, _id = call id."""
+    from pymongo import AsyncMongoClient
+
+    # ponytail: 500 ms server selection, so a dead Mongo costs a turn at most
+    # that, and only after the reply was spoken. Move writes to a background
+    # queue if the archive ever sits on a slow network.
+    return AsyncMongoClient(MONGO_URL, serverSelectionTimeoutMS=500).concierge.calls
+
+
+def transcript_update(user: str, assistant: str, cut: bool, usage: dict) -> dict:
+    """One finished turn as a Mongo upsert: append its messages, add its tokens."""
+    turn = [{"role": "user", "content": user}]
+    if assistant:
+        turn.append({"role": "assistant", "content": assistant, "cut": cut})
+    now = datetime.now(timezone.utc)
+    return {
+        "$push": {"turns": {"$each": turn}},
+        "$inc": {"tokens_in": usage["in"], "tokens_out": usage["out"]},
+        "$setOnInsert": {"started_at": now, "provider": PROVIDER, "model": MODEL},
+        "$set": {"updated_at": now},
+    }
+
+
+async def archive_turn(calls, call_id: str, update: dict) -> None:
+    """Upsert into the call's transcript. A record, not a dependency: a live
+    call never waits long on it or fails because of it."""
+    try:
+        await calls.update_one({"_id": call_id}, update, upsert=True)
+    except Exception as exc:
+        log.warning("transcript not saved for call %s: %r", call_id, exc)
+
+
 def cost_usd(model: str, tokens_in: int, tokens_out: int) -> float:
     p_in, p_out = PRICES.get(model, PRICES["claude-opus-5"])
     return (tokens_in * p_in + tokens_out * p_out) / 1_000_000
 
 
 async def respond(
-    sock: WebSocket, r: Redis, call_id: str, history: list[dict], meter: dict, text: str
+    sock: WebSocket,
+    r: Redis,
+    calls,
+    call_id: str,
+    history: list[dict],
+    meter: dict,
+    text: str,
 ) -> None:
     """One assistant turn. Cancellable mid-stream - that is the barge-in."""
     await remember(r, call_id, history, {"role": "user", "content": text})
     said = ""
+    cut = False
+    usage = {"in": 0, "out": 0}
     started = time.perf_counter()
     first_token_ms = None
     try:
-        usage = {"in": 0, "out": 0}
         buf = ""
         async for chunk in stream_reply(trim(history), usage):
             if first_token_ms is None:
@@ -233,6 +283,7 @@ async def respond(
             }
         )
     except asyncio.CancelledError:
+        cut = True
         raise  # barge-in; the partial answer is kept by the finally block
     except Exception as exc:
         # Never strand the caller on "thinking" - the UI has to be told.
@@ -245,6 +296,8 @@ async def respond(
             msg = {"role": "assistant", "content": said.strip()}
             with suppress(Exception):  # a Redis blip must not mask the turn's outcome
                 await remember(r, call_id, history, msg)
+        # The permanent record: everything, uncapped, with cut-off replies marked.
+        await archive_turn(calls, call_id, transcript_update(text, said.strip(), cut, usage))
 
 
 # Call ids come from the browser: accept only a UUID so a client can't pick
@@ -257,6 +310,7 @@ async def ws(sock: WebSocket, call: str = "") -> None:
     await sock.accept()
     call_id = call if _CALL_ID.fullmatch(call) else str(uuid.uuid4())
     r = get_redis()
+    calls = get_transcripts()  # lazy: no Mongo round trip until a turn finishes
     try:
         history = await load_history(r, call_id)
     except Exception as exc:
@@ -277,7 +331,7 @@ async def ws(sock: WebSocket, call: str = "") -> None:
                     await turn
             if kind == "user_text" and msg.get("text", "").strip():
                 turn = asyncio.create_task(
-                    respond(sock, r, call_id, history, meter, msg["text"].strip())
+                    respond(sock, r, calls, call_id, history, meter, msg["text"].strip())
                 )
     except WebSocketDisconnect:
         pass
