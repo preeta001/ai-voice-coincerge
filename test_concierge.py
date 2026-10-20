@@ -79,6 +79,47 @@ def test_history_survives_reconnect_capped_and_expiring():
     asyncio.run(go())
 
 
+def test_groq_stream_yields_text_and_usage():
+    # Fake Groq stream: text deltas, then a final chunk carrying usage the way
+    # Groq sends it (x_groq.usage). No key, no network.
+    from types import SimpleNamespace as NS
+
+    import server
+
+    def chunk(text=None, usage=None):
+        delta = NS(content=text)
+        return NS(choices=[NS(delta=delta)] if text else [], usage=None,
+                  x_groq=NS(usage=usage) if usage else None)
+
+    class FakeStream:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *exc): return False
+        def __aiter__(self):
+            async def gen():
+                for c in [chunk("Breakfast is "), chunk("seven to ten."),
+                          chunk(usage=NS(prompt_tokens=310, completion_tokens=12))]:
+                    yield c
+            return gen()
+
+    async def create(**kwargs):
+        assert kwargs["messages"][0]["role"] == "system"  # SYSTEM goes first
+        return FakeStream()
+
+    fake = NS(chat=NS(completions=NS(create=create)))
+    old = (server.PROVIDER, server.get_groq)
+    server.PROVIDER, server.get_groq = "groq", lambda: fake
+    try:
+        async def go():
+            usage = {"in": 0, "out": 0}
+            text = [t async for t in server.stream_reply([{"role": "user", "content": "hi"}], usage)]
+            return "".join(text), usage
+        text, usage = asyncio.run(go())
+    finally:
+        server.PROVIDER, server.get_groq = old
+    assert text == "Breakfast is seven to ten."
+    assert usage == {"in": 310, "out": 12}
+
+
 def test_cost_matches_list_pricing():
     # 1M in + 1M out on Opus 5 = $5 + $25.
     assert cost_usd("claude-opus-5", 1_000_000, 1_000_000) == 30.0

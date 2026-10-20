@@ -2,7 +2,8 @@
 
     python bench.py            # 12 turns
     python bench.py 30         # 30 turns
-    CONCIERGE_MODEL=claude-haiku-4-5 python bench.py
+    CONCIERGE_MODEL=claude-haiku-5-5 python bench.py
+    CONCIERGE_PROVIDER=groq python bench.py      # free tier, GROQ_API_KEY
 
 Reports time-to-first-sentence, which is what the guest actually waits for -
 time-to-first-token is only when the server starts producing, and nothing is
@@ -14,7 +15,7 @@ import statistics
 import sys
 import time
 
-from server import MODEL, SYSTEM, cost_usd, get_client, split_sentences
+from server import MODEL, PROVIDER, cost_usd, split_sentences, stream_reply
 
 TURNS = [
     "hi, what time is breakfast?",
@@ -36,28 +37,21 @@ async def one_turn(text: str) -> dict:
     started = time.perf_counter()
     first_token = first_sentence = None
     buf = ""
-    async with get_client().messages.stream(
-        model=MODEL,
-        max_tokens=300,
-        system=SYSTEM,
-        messages=[{"role": "user", "content": text}],
-        output_config={"effort": "low"},
-    ) as stream:
-        async for chunk in stream.text_stream:
-            now = time.perf_counter()
-            if first_token is None:
-                first_token = now - started
-            buf += chunk
-            sentences, buf = split_sentences(buf)
-            if sentences and first_sentence is None:
-                first_sentence = now - started
-        usage = (await stream.get_final_message()).usage
+    usage = {"in": 0, "out": 0}
+    async for chunk in stream_reply([{"role": "user", "content": text}], usage):
+        now = time.perf_counter()
+        if first_token is None:
+            first_token = now - started
+        buf += chunk
+        sentences, buf = split_sentences(buf)
+        if sentences and first_sentence is None:
+            first_sentence = now - started
     return {
         "first_token": first_token,
         "first_sentence": first_sentence or (time.perf_counter() - started),
         "total": time.perf_counter() - started,
-        "usd": cost_usd(MODEL, usage.input_tokens, usage.output_tokens),
-        "tokens": usage.input_tokens + usage.output_tokens,
+        "usd": cost_usd(MODEL, usage["in"], usage["out"]),
+        "tokens": usage["in"] + usage["out"],
     }
 
 
@@ -67,7 +61,7 @@ def pct(values: list[float], p: float) -> float:
 
 async def main() -> None:
     n = int(sys.argv[1]) if len(sys.argv) > 1 else len(TURNS)
-    print(f"model={MODEL}  turns={n}\n")
+    print(f"provider={PROVIDER}  model={MODEL}  turns={n}\n")
     rows = []
     for i in range(n):
         r = await one_turn(TURNS[i % len(TURNS)])

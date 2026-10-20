@@ -86,15 +86,30 @@ The per-socket cost meter still resets on reconnect; the history does not.
 
 ## Measured numbers
 
-Run `python bench.py` and paste your own results here. It reports p50/p95 for
-time-to-first-token, time-to-first-speech, and full turn, plus cost per turn and
-a projection per 1,000 turns.
+`bench.py` reports p50/p95 for time-to-first-token, time-to-first-speech, and
+full turn, plus cost per turn. Measured 21 Oct 2026 on Groq's free tier, from
+India, single-turn prompts:
 
-| metric | p50 | p95 |
-| --- | --- | --- |
-| time to first token | _run bench.py_ | |
-| time to first speech | | |
-| full turn | | |
+| model (Groq) | turns | first speech p50 | first speech p95 | full turn p50 | $ / 1,000 turns* |
+| --- | --- | --- | --- | --- | --- |
+| `qwen/qwen3.8-27b` | 30 | **231 ms** | 3,518 ms | 271 ms | 0.31 |
+| `openai/gpt-oss-120b` | 12 | 816 ms | 5,706 ms | 830 ms | 0.09 |
+| `openai/gpt-oss-20b` | 12 | 1,294 ms | 6,900 ms | 1,309 ms | 0.04 |
+
+\*at paid-tier list price; the free tier bills $0.
+
+Reading it honestly: the median is what a caller usually feels, and Qwen starts
+speaking in about a quarter of a second. The p95 is a few slow outliers per run,
+consistent with queueing on shared free capacity, not with the model; a paid
+tier or dedicated capacity is how you'd cut that tail. With 12 turns the p95 is
+simply the slowest turn, so the 30-turn row is the one to trust. Claude numbers
+are not in the table because they need a paid key.
+
+**Two providers, one code path.** `CONCIERGE_PROVIDER=anthropic` (default) runs
+Claude; `CONCIERGE_PROVIDER=groq` runs open models on Groq, which has a free
+tier. Only `stream_reply()` in `server.py` knows which one is live; the server
+and `bench.py` both stream through it, so the benchmark measures exactly what a
+caller hears.
 
 Model is set by `CONCIERGE_MODEL`. Default is `claude-opus-5`;
 `claude-haiku-5-5` is the latency- and cost-optimised swap — worth running the
@@ -106,6 +121,11 @@ benchmark on both before deciding. (`claude-haiku-4-5` rejects the
 | `claude-opus-5` | 5.00 | 25.00 |
 | `claude-sonnet-5` | 2.00 | 10.00 |
 | `claude-haiku-5-5` | 0.10 | 0.50 |
+| `openai/gpt-oss-120b` (Groq) | 0.15 | 0.60 |
+| `qwen/qwen3.8-27b` (Groq) | 0.80 | 4.00 |
+
+Groq's free tier bills $0; its rows show what the same traffic would cost on
+the paid tier.
 
 ## Scope
 
