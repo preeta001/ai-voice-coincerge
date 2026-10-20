@@ -95,10 +95,18 @@ id): `$push` appends the guest's line and the reply to an uncapped `turns`
 array, cut-off replies are marked `"cut": true`, and `$inc` keeps token totals.
 One document per call reads naturally as a transcript and needs no joins.
 
-The write happens after the reply has been spoken, so it never delays speech,
-and it is best-effort: if MongoDB is down, the turn is logged as not archived
-and the call carries on (a test points the real driver at a dead port to prove
-it).
+Turns only *enqueue* their record; one writer task per connection drains the
+queue to MongoDB in order. So the write never delays speech (a cold Atlas
+connection from India took 2.6 s), barge-in can't cancel or reorder it, and on
+hang-up the server drains the queue before closing. It is best-effort: if
+MongoDB is down, the turn is logged as not archived and the call carries on
+(a test points the real driver at a dead port to prove it). Token totals count
+completed replies; a reply cut off mid-stream reports no usage.
+
+A cancel can also land *after* the reply finished - a hang-up or barge-in
+during the turn's bookkeeping. The record is queued first (synchronous, can't
+be interrupted) and the Redis save is shielded and serialised by a per-call
+lock, so neither is lost and history order holds. There is a regression test.
 
 ## Measured numbers
 

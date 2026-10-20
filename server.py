@@ -201,10 +201,10 @@ def get_transcripts():
     """Mongo collection `concierge.calls`: one document per call, _id = call id."""
     from pymongo import AsyncMongoClient
 
-    # ponytail: 500 ms server selection, so a dead Mongo costs a turn at most
-    # that, and only after the reply was spoken. Move writes to a background
-    # queue if the archive ever sits on a slow network.
-    return AsyncMongoClient(MONGO_URL, serverSelectionTimeoutMS=500).concierge.calls
+    # Writes go through archive_writer's queue, off the speaking path, so a
+    # cold Atlas connection (~2.6 s from India) or a dead server costs the
+    # caller nothing; 5 s just bounds how long one write may hang.
+    return AsyncMongoClient(MONGO_URL, serverSelectionTimeoutMS=5000).concierge.calls
 
 
 def transcript_update(user: str, assistant: str, cut: bool, usage: dict) -> dict:
@@ -230,22 +230,40 @@ async def archive_turn(calls, call_id: str, update: dict) -> None:
         log.warning("transcript not saved for call %s: %r", call_id, exc)
 
 
+async def archive_writer(calls, call_id: str, queue: asyncio.Queue) -> None:
+    """One per connection: writes its turns to Mongo in order until None.
+
+    Turns only enqueue (instant, can't be interrupted), so barge-in - which
+    cancels turns - can never cancel a write or reorder the transcript.
+    """
+    while (update := await queue.get()) is not None:
+        await archive_turn(calls, call_id, update)
+
+
 def cost_usd(model: str, tokens_in: int, tokens_out: int) -> float:
     p_in, p_out = PRICES.get(model, PRICES["claude-opus-5"])
     return (tokens_in * p_in + tokens_out * p_out) / 1_000_000
 
 
+async def save_reply(lock: asyncio.Lock, r: Redis, call_id: str, history: list[dict], msg: dict):
+    async with lock:
+        with suppress(Exception):  # a Redis blip must not mask the turn's outcome
+            await remember(r, call_id, history, msg)
+
+
 async def respond(
     sock: WebSocket,
     r: Redis,
-    calls,
+    lock: asyncio.Lock,
+    archive: asyncio.Queue,
     call_id: str,
     history: list[dict],
     meter: dict,
     text: str,
 ) -> None:
     """One assistant turn. Cancellable mid-stream - that is the barge-in."""
-    await remember(r, call_id, history, {"role": "user", "content": text})
+    async with lock:  # FIFO: this turn's writes queue behind the last turn's
+        await remember(r, call_id, history, {"role": "user", "content": text})
     said = ""
     cut = False
     usage = {"in": 0, "out": 0}
@@ -290,14 +308,16 @@ async def respond(
         with suppress(Exception):
             await sock.send_json({"type": "error", "text": str(exc)[:200]})
     finally:
-        # Keep whatever was actually spoken before the cut, so the next turn's
-        # context matches what the guest heard - not what the model planned.
+        # A cancel can land here too: barge-in or hang-up just after the reply
+        # finished. So the bookkeeping must not be interruptible.
+        # 1) The permanent record, queued synchronously - nothing can cut it.
+        archive.put_nowait(transcript_update(text, said.strip(), cut, usage))
+        # 2) Keep whatever was actually spoken, so the next turn's context matches
+        #    what the guest heard. Shielded: a cancel can't abort it halfway, and
+        #    the lock keeps the next turn's write behind this one in Redis.
         if said.strip():
             msg = {"role": "assistant", "content": said.strip()}
-            with suppress(Exception):  # a Redis blip must not mask the turn's outcome
-                await remember(r, call_id, history, msg)
-        # The permanent record: everything, uncapped, with cut-off replies marked.
-        await archive_turn(calls, call_id, transcript_update(text, said.strip(), cut, usage))
+            await asyncio.shield(save_reply(lock, r, call_id, history, msg))
 
 
 # Call ids come from the browser: accept only a UUID so a client can't pick
@@ -310,7 +330,6 @@ async def ws(sock: WebSocket, call: str = "") -> None:
     await sock.accept()
     call_id = call if _CALL_ID.fullmatch(call) else str(uuid.uuid4())
     r = get_redis()
-    calls = get_transcripts()  # lazy: no Mongo round trip until a turn finishes
     try:
         history = await load_history(r, call_id)
     except Exception as exc:
@@ -319,6 +338,9 @@ async def ws(sock: WebSocket, call: str = "") -> None:
         return
     meter = {"in": 0, "out": 0, "turns": 0}
     turn: asyncio.Task | None = None
+    lock = asyncio.Lock()
+    archive: asyncio.Queue = asyncio.Queue()
+    writer = asyncio.create_task(archive_writer(get_transcripts(), call_id, archive))
     try:
         while True:
             msg = await sock.receive_json()
@@ -331,13 +353,17 @@ async def ws(sock: WebSocket, call: str = "") -> None:
                     await turn
             if kind == "user_text" and msg.get("text", "").strip():
                 turn = asyncio.create_task(
-                    respond(sock, r, calls, call_id, history, meter, msg["text"].strip())
+                    respond(sock, r, lock, archive, call_id, history, meter, msg["text"].strip())
                 )
     except WebSocketDisconnect:
         pass
     finally:
         if turn and not turn.done():
             turn.cancel()
+            with suppress(asyncio.CancelledError):
+                await turn  # its last words reach the queue before we close it
+        archive.put_nowait(None)
+        await writer  # drain: the call's transcript is complete when we return
 
 
 # Absolute so the server runs from any working directory.

@@ -105,6 +105,76 @@ def test_archive_upserts_one_document_per_call():
     assert seen == [({"_id": "call-1"}, True)]
 
 
+def test_archive_writer_keeps_order_and_drains_on_close():
+    # Slow first write, fast second: the transcript must still be in order,
+    # and closing the queue must wait for both rather than drop the tail.
+    written = []
+
+    class SlowThenFast:
+        async def update_one(self, flt, update, upsert=False):
+            await asyncio.sleep(0.05 if update["n"] == 1 else 0)
+            written.append(update["n"])
+
+    async def go():
+        from server import archive_writer
+
+        q = asyncio.Queue()
+        writer = asyncio.create_task(archive_writer(SlowThenFast(), "call-1", q))
+        q.put_nowait({"n": 1})
+        q.put_nowait({"n": 2})
+        q.put_nowait(None)
+        await writer
+
+    asyncio.run(go())
+    assert written == [1, 2]
+
+
+def test_hangup_right_after_reply_keeps_record_and_history():
+    # Regression: the guest hangs up the instant the reply ends, while the turn
+    # is still saving. The cancel used to abort the save and drop the record.
+    import server
+
+    async def fake_stream(messages, usage):
+        usage.update({"in": 270, "out": 9})
+        yield "Check-in is at three PM."
+
+    slow_real = server.remember
+
+    async def slow_remember(*a):
+        await asyncio.sleep(0.05)  # widen the window the cancel lands in
+        await slow_real(*a)
+
+    class Sock:
+        def __init__(self): self.sent = []
+        async def send_json(self, m): self.sent.append(m["type"])
+
+    async def go():
+        r = fakeredis.FakeAsyncRedis(decode_responses=True)
+        history, archive, sock = [], asyncio.Queue(), Sock()
+        old = (server.stream_reply, server.remember)
+        server.stream_reply, server.remember = fake_stream, slow_remember
+        try:
+            turn = asyncio.create_task(server.respond(
+                sock, r, asyncio.Lock(), archive, "c", history,
+                {"in": 0, "out": 0, "turns": 0}, "check-in time?"))
+            while "done" not in sock.sent:
+                await asyncio.sleep(0.001)
+            turn.cancel()  # hang-up lands inside the bookkeeping
+            try:
+                await turn
+            except asyncio.CancelledError:
+                pass
+            await asyncio.sleep(0.2)  # the shielded save finishes on its own
+        finally:
+            server.stream_reply, server.remember = old
+        record = archive.get_nowait()
+        assert record["$push"]["turns"]["$each"][-1] == {
+            "role": "assistant", "content": "Check-in is at three PM.", "cut": False}
+        assert [m["role"] for m in await load_history(r, "c")] == ["user", "assistant"]
+
+    asyncio.run(go())
+
+
 def test_archive_survives_mongo_being_down():
     # Real driver, nothing listening: the call must carry on, quickly.
     import time
